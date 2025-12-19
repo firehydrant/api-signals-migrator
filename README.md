@@ -1,6 +1,6 @@
 ## Signals Migrators (Opsgenie & PagerDuty) → FireHydrant
 
-Scripts and helpers to migrate teams, users, on‑call schedules/rotations, overrides and escalation policies into FireHydrant Signals from Opsgenie or PagerDuty.
+Scripts and helpers to migrate teams, users, on‑call schedules/rotations, overrides and escalation policies into FireHydrant Signals from Opsgenie or PagerDuty.  Scripts are written and maintained by Firehydrant Customer Success Engineering.
 
 ### Repo layout
 - `signals-migrator-opsgenie.py` (OG → FH)
