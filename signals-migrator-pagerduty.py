@@ -1,19 +1,33 @@
 #!/usr/bin/env python3
 # Migrator: PagerDuty → FireHydrant
-# Usage: python3 migrate-teams-pd.py [flags]
+# Usage: python3 signals-migrator-pagerduty.py [flags]
 #
 # Notes:
 # - Reads FIREHYDRANT_API_KEY and PAGERDUTY_API_TOKEN from environment (.env via config.env supported)
+# - If FIREHYDRANT_API_KEY is already exported in the shell, it wins over config.env (load_dotenv override=False).
+# - If PAGERDUTY_BASE_URL is unset, probes US then EU API hosts so EU accounts work without manual config
 # - Default output is minimal, with 5 stage lines per team; use --verbose for details
 
 import os
 import sys
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
 
+_CONFIG_ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.env")
+_shell_fh_key_before_dotenv = (os.environ.get("FIREHYDRANT_API_KEY") or "").strip()
+_file_fh_key_from_config = ""
 try:
-    from dotenv import load_dotenv
-    load_dotenv('config.env', override=True)
+    from dotenv import dotenv_values, load_dotenv
+
+    try:
+        _file_fh_key_from_config = (
+            (dotenv_values(_CONFIG_ENV_PATH) or {}).get("FIREHYDRANT_API_KEY") or ""
+        ).strip()
+    except Exception:
+        pass
+    # Do not override existing env vars — shell exports win over config.env (avoids stale tokens in file).
+    load_dotenv(_CONFIG_ENV_PATH, override=False)
 except Exception:
     pass
 
@@ -27,12 +41,30 @@ FIREHYDRANT_API_KEY = os.getenv('FIREHYDRANT_API_KEY') or ''
 PAGERDUTY_API_TOKEN = os.getenv('PAGERDUTY_API_TOKEN') or os.getenv('PAGERDUTY_TOKEN') or ''
 
 _SETUP_FLAGS = any(f in sys.argv for f in ("--set-fh-token","--set-pd-token","--configure"))
+_JUST_HELP = any(f in sys.argv for f in ("--help", "-h"))
+
+
+def _warn_if_shell_firehydrant_key_overrides_file() -> None:
+    """Shell-exported FIREHYDRANT_API_KEY wins over config.env; warn when that hides a different file value."""
+    if _SETUP_FLAGS or _JUST_HELP:
+        return
+    if not _shell_fh_key_before_dotenv:
+        return
+    if _file_fh_key_from_config and _file_fh_key_from_config != _shell_fh_key_before_dotenv:
+        print(
+            "⚠️  FIREHYDRANT_API_KEY is set in your shell and overrides config.env (the values differ). "
+            "The migrator uses the shell value."
+        )
+        print("    To use only config.env: unset FIREHYDRANT_API_KEY")
+
+
+_warn_if_shell_firehydrant_key_overrides_file()
+
 if not FIREHYDRANT_API_KEY and not _SETUP_FLAGS:
     print("❌ FIREHYDRANT_API_KEY not set")
     sys.exit(1)
 # Allow FH-only operations or setup without a PD token (revert/delete/configure)
 _FH_ONLY = any(f in sys.argv for f in ("--revert-all","--delete-team","--delete","--delete-schedule"))
-_JUST_HELP = any(f in sys.argv for f in ("--help","-h"))
 if not PAGERDUTY_API_TOKEN and not (_FH_ONLY or _JUST_HELP or _SETUP_FLAGS):
     print("❌ PAGERDUTY_API_TOKEN not set")
     sys.exit(1)
@@ -45,6 +77,18 @@ VERBOSE = (os.getenv('VERBOSE_LOGS', 'false').lower() in ('1','true','yes')) or 
 SUMMARY_ONLY = True
 NO_OVERRIDES = ('--no-overrides' in sys.argv)
 DRY_RUN = ('--dry-run' in sys.argv)
+
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int((os.getenv(name) or str(default)).strip())
+    except Exception:
+        return default
+
+
+# How far back/forward to pull PagerDuty schedule overrides into FireHydrant (GET /schedules/{id}/overrides).
+PD_OVERRIDE_SINCE_DAYS = _int_env("PD_OVERRIDE_SINCE_DAYS", 365)
+PD_OVERRIDE_UNTIL_DAYS = _int_env("PD_OVERRIDE_UNTIL_DAYS", 730)
 VERIFY_ONLY = ('--verify-only' in sys.argv)
 ALIGN_NOW = (('--no-align' not in sys.argv) or ('--align' in sys.argv))
 TIMEZONE_OVERRIDE = os.getenv('TIMEZONE_OVERRIDE')
@@ -68,8 +112,75 @@ if '--output' in sys.argv:
     except Exception:
         pass
 
+PROVISION_MISSING_USERS = ('--provision-missing-users' in sys.argv) or (os.getenv('FH_PROVISION_MISSING', '').lower() in ('1', 'true', 'yes'))
+NO_PROVISION_MISSING = '--no-provision-missing' in sys.argv
+
+def _pd_group_by_explicitly_set() -> bool:
+    """True if user set PD_GROUP_BY via env or --pd-group-by / --pd-group."""
+    if (os.environ.get('PD_GROUP_BY') or '').strip():
+        return True
+    av = sys.argv[1:]
+    return '--pd-group-by' in av or '--pd-group' in av
+
+_PD_GROUPING_PICK_TITLE = (
+    "Let's fill out your teams in FireHydrant.\n"
+    "Which team interface would you like to use?"
+)
+_PD_GROUPING_OPTIONS = ["PagerDuty team", "PagerDuty service"]
+
+def prompt_pd_import_grouping_if_needed() -> None:
+    """Ask teams vs services when not configured; same FH migration steps, different PD bucket list."""
+    global PD_GROUP_BY
+    if _pd_group_by_explicitly_set():
+        return
+    if (PD_GROUP_BY or '').strip():
+        return
+    try:
+        if not sys.stdin.isatty():
+            return
+    except Exception:
+        return
+
+    def _confirm():
+        if PD_GROUP_BY == 'services':
+            print("ℹ️  One FireHydrant team per PagerDuty service.")
+        else:
+            print("ℹ️  One FireHydrant team per PagerDuty team.")
+
+    if PICK_AVAILABLE:
+        try:
+            _, index = pick(_PD_GROUPING_OPTIONS, _PD_GROUPING_PICK_TITLE, multiselect=False)
+            PD_GROUP_BY = 'teams' if index == 0 else 'services'
+            _confirm()
+        except KeyboardInterrupt:
+            print("\n✋ Using default: PagerDuty team")
+            PD_GROUP_BY = 'teams'
+            _confirm()
+        return
+
+    # Fallback (no pick): Terraform-style framed lines + typed choice
+    print("\n┃ Let's fill out your teams in FireHydrant.")
+    print("┃ Which team interface would you like to use?")
+    print("┃")
+    print("┃   1) PagerDuty team")
+    print("┃   2) PagerDuty service")
+    try:
+        raw = input("\nEnter 1 or 2 (default 1): ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print("\n✋ Using default: PagerDuty team")
+        PD_GROUP_BY = 'teams'
+        _confirm()
+        return
+    if raw in ('2', 's', 'service', 'services'):
+        PD_GROUP_BY = 'services'
+    else:
+        PD_GROUP_BY = 'teams'
+    _confirm()
+
 CONCURRENCY = int(os.getenv('MIGRATOR_CONCURRENCY', '16'))
-PD_ENFORCE_BOUNDARIES = (os.getenv('PD_ENFORCE_BOUNDARIES', 'true').lower() in ('1','true','yes'))
+# When true, POSTs one FH "override" per PD /oncalls segment (often huge + overlapping); can 500 on FireHydrant.
+# PD schedule overrides (from /schedules/{id}/overrides) are applied regardless. Opt in: PD_ENFORCE_BOUNDARIES=true
+PD_ENFORCE_BOUNDARIES = (os.getenv("PD_ENFORCE_BOUNDARIES", "false").lower() in ("1", "true", "yes"))
 
 # Pooled session
 try:
@@ -187,6 +298,34 @@ PD_HEADERS = {
     "User-Agent": "signals-migrator-pd/1.0"
 }
 
+# Official REST hosts; EU accounts must use the EU host or many endpoints return 402/403.
+PD_API_HOST_US = "https://api.pagerduty.com"
+PD_API_HOST_EU = "https://api.eu.pagerduty.com"
+
+def pd_resolve_pagerduty_api_host() -> None:
+    """If PAGERDUTY_BASE_URL is not set in the environment, probe US then EU so customer accounts work without manual config."""
+    global PAGERDUTY_BASE_URL
+    if (os.environ.get("PAGERDUTY_BASE_URL") or "").strip():
+        return
+    if not PAGERDUTY_API_TOKEN:
+        return
+    for base in (PD_API_HOST_US, PD_API_HOST_EU):
+        try:
+            r = requests.get(f"{base}/users", headers=PD_HEADERS, params={"limit": 1}, timeout=45)
+        except requests.exceptions.RequestException as e:
+            vprint(f"PD API probe {base}: {e}")
+            continue
+        if r.status_code == 401:
+            print("❌ PagerDuty API rejected the token (401). Check PAGERDUTY_API_TOKEN (Integrations → API Access Keys).")
+            sys.exit(1)
+        if r.status_code == 200:
+            PAGERDUTY_BASE_URL = base
+            if base == PD_API_HOST_EU:
+                print(f"ℹ️  Using PagerDuty EU API ({base}). To force US, set PAGERDUTY_BASE_URL={PD_API_HOST_US} in config.env.")
+            return
+    print("❌ Could not reach PagerDuty API with this token (tried US and EU hosts). Check the token and network.")
+    sys.exit(1)
+
 def _pd_paginate(endpoint: str, params: dict = None, item_key: str = None):
     url = f"{PAGERDUTY_BASE_URL}{endpoint}"
     params = dict(params or {})
@@ -241,19 +380,113 @@ def pd_fetch_teams():
     if PD_NO_TEAMS:
         # Fallback single global bucket
         return [{"id": "global", "name": "PagerDuty Global"}]
-    return _pd_paginate("/teams", {}, "teams")
+    teams = _pd_paginate("/teams", {}, "teams")
+    # 402 on /teams sets PD_NO_TEAMS and returns []; use per-service buckets (same as --pd-group-by services)
+    if not teams and PD_NO_TEAMS:
+        svcs = pd_fetch_services() or []
+        if svcs:
+            print("ℹ️  Using PagerDuty services as migration buckets (Teams API unavailable or plan limits /teams).")
+        return [{"id": f"service:{s.get('id')}", "name": f"{s.get('name') or 'Service'}", "_service": s} for s in svcs]
+    return teams
 
 def pd_fetch_users():
     return _pd_paginate("/users", {}, "users")
 
+def _resolve_pd_user_email(uid: str) -> str:
+    """Resolve PD user id → email (cache, then GET /users/{id})."""
+    if not uid:
+        return ''
+    if uid in PD_USER_EMAIL_BY_ID:
+        return PD_USER_EMAIL_BY_ID[uid]
+    try:
+        ur = requests.get(f"{PAGERDUTY_BASE_URL}/users/{uid}", headers=PD_HEADERS)
+        if ur.status_code == 200:
+            em = (ur.json().get('user') or {}).get('email') or ''
+            if em:
+                PD_USER_EMAIL_BY_ID[uid] = em
+                return em
+    except Exception:
+        pass
+    return ''
+
+def pd_team_members_for_service(svc_id: str) -> list:
+    """Members of PD team(s) linked to the service (GET /services/{id} → teams[] → /teams/{id}/members)."""
+    if not svc_id:
+        return []
+    r = requests.get(
+        f"{PAGERDUTY_BASE_URL}/services/{svc_id}",
+        headers=PD_HEADERS,
+        params=[("include[]", "teams")],
+    )
+    vprint(f"PD GET /services/{svc_id} (teams linked to service) → {r.status_code}")
+    if r.status_code != 200:
+        return []
+    svc = r.json().get("service") or {}
+    team_refs = svc.get("teams") or []
+    if not team_refs and isinstance(svc.get("team"), dict):
+        team_refs = [svc["team"]]
+    all_members = []
+    seen_uid = set()
+    for tr in team_refs:
+        tid = (tr or {}).get("id") if isinstance(tr, dict) else None
+        if not tid:
+            continue
+        try:
+            members = _pd_paginate(f"/teams/{tid}/members", {}, "members")
+        except Exception:
+            members = []
+        for m in members or []:
+            uid = (m.get("user") or {}).get("id")
+            if uid and uid in seen_uid:
+                continue
+            if uid:
+                seen_uid.add(uid)
+            all_members.append(m)
+    try:
+        for m in all_members:
+            u = m.get("user") or {}
+            uid = u.get("id")
+            email = u.get("email") or (uid and _resolve_pd_user_email(uid))
+            if uid and email:
+                PD_USER_EMAIL_BY_ID[uid] = email
+    except Exception:
+        pass
+    return all_members
+
+def pd_team_members_for_bucket(bucket_id: str) -> list:
+    """Team members for migration: real PD team id, or service → linked team member roster."""
+    if bucket_id and str(bucket_id).startswith("service:"):
+        return pd_team_members_for_service(bucket_id.split("service:", 1)[1])
+    return pd_team_members(bucket_id)
+
 def pd_team_members(team_id: str):
+    if team_id and str(team_id).startswith("service:"):
+        return []
     if PD_NO_TEAMS or team_id == "global":
         # No teams in PD; return empty. We'll derive members from schedules/participants when creating.
         return []
-    return _pd_paginate(f"/teams/{team_id}/members", {}, "members")
+    members = _pd_paginate(f"/teams/{team_id}/members", {}, "members")
+    try:
+        for m in members or []:
+            u = m.get('user') or {}
+            uid = u.get('id')
+            email = u.get('email') or (uid and _resolve_pd_user_email(uid))
+            if uid and email:
+                PD_USER_EMAIL_BY_ID[uid] = email
+    except Exception:
+        pass
+    return members
+
+def pd_team_member_email(m: dict) -> str:
+    """Email for a PD team member object (embedded email or resolve via user id)."""
+    u = m.get('user') or {}
+    return (u.get('email') or _resolve_pd_user_email(u.get('id')) or '').strip()
 
 def pd_team_schedules(team_id: str):
-    # list schedules filtered by team
+    # list schedules filtered by team, or (service mode) schedules referenced by the service EP
+    if team_id and str(team_id).startswith("service:"):
+        svc_id = team_id.split("service:", 1)[1]
+        return pd_schedules_for_service_id(svc_id)
     if PD_NO_TEAMS or team_id == "global":
         return _pd_paginate("/schedules", {}, "schedules")
     return _pd_paginate("/schedules", {"team_ids[]": team_id}, "schedules")
@@ -338,6 +571,15 @@ def pd_oncall_segments_for_schedule(schedule_id: str, since_iso: str, until_iso:
     return segments
 
 def pd_fetch_escalation_policies(team_id: str):
+    if team_id and str(team_id).startswith("service:"):
+        svc_id = team_id.split("service:", 1)[1]
+        r = requests.get(f"{PAGERDUTY_BASE_URL}/services/{svc_id}", headers=PD_HEADERS)
+        if r.status_code != 200:
+            return []
+        svc = r.json().get("service") or {}
+        ep_ref = (svc.get("escalation_policy") or {}).get("id")
+        ep = pd_escalation_policy_details(ep_ref) if ep_ref else None
+        return [ep] if ep else []
     if PD_NO_TEAMS or team_id == "global":
         return _pd_paginate("/escalation_policies", {}, "escalation_policies")
     return _pd_paginate("/escalation_policies", {"team_ids[]": team_id}, "escalation_policies")
@@ -419,77 +661,332 @@ FH_HEADERS = {
     "Content-Type": "application/json"
 }
 
+def _fh_format_api_errors(r: requests.Response) -> str:
+    """Include message and full error.errors (list or field→messages dict) when present."""
+    raw = (r.text or "").strip()
+    try:
+        j = r.json()
+    except Exception:
+        return raw or f"HTTP {r.status_code}"
+    if not isinstance(j, dict):
+        return raw or f"HTTP {r.status_code}"
+    parts = []
+    msg = j.get("message")
+    if isinstance(msg, str) and msg.strip():
+        parts.append(msg.strip())
+    det = j.get("detail")
+    if isinstance(det, str) and det.strip():
+        parts.append(det.strip())
+    msgs = j.get("messages")
+    if isinstance(msgs, str) and msgs.strip():
+        parts.append(msgs.strip())
+    elif isinstance(msgs, list) and msgs:
+        parts.append("; ".join(str(x) for x in msgs))
+    errs = j.get("errors")
+    if errs is not None:
+        if isinstance(errs, list):
+            parts.append("errors: " + "; ".join(str(x) for x in errs))
+        elif isinstance(errs, dict):
+            for k, v in errs.items():
+                if isinstance(v, list):
+                    parts.append(f"{k}: " + "; ".join(str(x) for x in v))
+                else:
+                    parts.append(f"{k}: {v}")
+    if parts:
+        return " | ".join(parts)
+    return raw or f"HTTP {r.status_code}"
+
 def fh_fetch_teams():
     items = []
     page = 1
-    while True:
-        r = requests.get(f"{FIREHYDRANT_BASE_URL}/teams?page={page}", headers=FH_HEADERS)
+    per_page = 200
+    while page <= 500:
+        r = requests.get(
+            f"{FIREHYDRANT_BASE_URL}/teams",
+            headers=FH_HEADERS,
+            params={"page": page, "per_page": per_page},
+            timeout=45,
+        )
         if r.status_code != 200:
             break
         data = r.json()
-        arr = data.get('data') if isinstance(data, dict) else data
-        if not arr:
-            break
+        arr = data.get("data") if isinstance(data, dict) else data
+        arr = arr or []
         items.extend(arr)
-        if len(arr) < 100:
+        if len(arr) < per_page:
             break
         page += 1
     return items
 
 def fh_fetch_users():
+    """Paginate GET /users with explicit per_page — default page size is often 20; old logic assumed 100 and stopped early."""
     items = []
     page = 1
-    while True:
-        r = requests.get(f"{FIREHYDRANT_BASE_URL}/users?page={page}", headers=FH_HEADERS)
+    per_page = 200
+    while page <= 500:
+        r = requests.get(
+            f"{FIREHYDRANT_BASE_URL}/users",
+            headers=FH_HEADERS,
+            params={"page": page, "per_page": per_page},
+            timeout=45,
+        )
         if r.status_code != 200:
+            vprint(f"FH GET /users page={page} → {r.status_code}")
             break
         data = r.json()
-        arr = data.get('data') if isinstance(data, dict) else data
-        if not arr:
-            break
+        arr = data.get("data") if isinstance(data, dict) else data
+        arr = arr or []
         items.extend(arr)
-        if len(arr) < 100:
+        if len(arr) < per_page:
             break
         page += 1
     return items
 
+
+def fh_enrich_users_list_with_scim_lookup(fh_users: list, emails: list) -> list:
+    """Resolve emails not matched from GET /users via SCIM userName (list payloads often omit or truncate emails)."""
+    out = list(fh_users or [])
+    seen_ids = {u.get("id") for u in out if u and u.get("id")}
+    for raw in emails or []:
+        em = (raw or "").strip()
+        if not em:
+            continue
+        if fh_find_user_by_email(em, out):
+            continue
+        alt = fh_scim_lookup_user_by_email(em)
+        if alt and alt.get("id") and alt["id"] not in seen_ids:
+            vprint(f"  ℹ️  Matched {em!r} via SCIM userName (not matched from GET /users payload)")
+            out.append(alt)
+            seen_ids.add(alt["id"])
+    return out
+
+
+def _fh_user_primary_email(u: dict) -> str:
+    """Normalize email from FH user payloads (top-level, primary_email, SCIM-style emails[], or login-style userName)."""
+    if not u:
+        return ''
+    e = u.get('email')
+    if e:
+        return str(e).strip().lower()
+    e = u.get('primary_email')
+    if e:
+        return str(e).strip().lower()
+    for ent in (u.get('emails') or []):
+        if isinstance(ent, dict) and ent.get('value'):
+            return str(ent['value']).strip().lower()
+    for key in ('user_name', 'userName', 'username', 'login'):
+        v = u.get(key)
+        if v and '@' in str(v):
+            return str(v).strip().lower()
+    return ''
+
 def fh_find_user_by_email(email: str, fh_users: list):
     em_l = (email or '').strip().lower()
+    if not em_l:
+        return None
     for u in fh_users or []:
-        if (u.get('email') or '').lower() == em_l:
+        if _fh_user_primary_email(u) == em_l:
             return u
     return None
+
+def _email_to_scim_name(email: str) -> tuple:
+    local = (email or '').split('@')[0].split('+')[0]
+    parts = local.replace('.', ' ').replace('_', ' ').split()
+    if not parts:
+        return "User", "Imported"
+    if len(parts) == 1:
+        return parts[0].title(), "User"
+    return parts[0].title(), ' '.join(parts[1:]).title()
+
+def _pd_user_scim_name(pd_user_id: str) -> tuple:
+    if not pd_user_id:
+        return None, None
+    try:
+        r = requests.get(f"{PAGERDUTY_BASE_URL}/users/{pd_user_id}", headers=PD_HEADERS)
+        if r.status_code != 200:
+            return None, None
+        u = r.json().get('user') or {}
+        name = u.get('name')
+        if isinstance(name, str) and name.strip():
+            ps = name.strip().split(None, 1)
+            return (ps[0], ps[1] if len(ps) > 1 else "User")
+        if isinstance(name, dict):
+            gn = (name.get('given_name') or name.get('givenName') or '').strip()
+            fn = (name.get('family_name') or name.get('familyName') or '').strip()
+            if gn or fn:
+                return (gn or "User", fn or "User")
+    except Exception:
+        pass
+    return None, None
+
+def fh_scim_provision_user(email: str, pd_user_id: str = None) -> bool:
+    """POST /v1/scim/v2/Users — see https://docs.firehydrant.com/reference/create_scim_user"""
+    if not email:
+        return False
+    if DRY_RUN:
+        vprint(f"🧪 Would SCIM-provision user {email!r}")
+        return True
+    if VERIFY_ONLY:
+        return False
+    given, family = _email_to_scim_name(email)
+    if pd_user_id:
+        g, f = _pd_user_scim_name(pd_user_id)
+        if g and f:
+            given, family = g, f
+    payload = {
+        "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+        "userName": email,
+        "name": {"givenName": given, "familyName": family},
+        "emails": [{"value": email, "primary": True}],
+    }
+    if pd_user_id:
+        payload["externalId"] = str(pd_user_id)
+    h = {**FH_HEADERS, "Content-Type": "application/scim+json"}
+    r = requests.post(f"{FIREHYDRANT_BASE_URL}/scim/v2/Users", headers=h, json=payload)
+    vprint(f"SCIM POST {email!r} → {r.status_code}")
+    if r.status_code in (200, 201):
+        return True
+    if r.status_code == 409:
+        vprint(f"  ℹ️ User already exists in FireHydrant: {email!r}")
+        return True
+    detail = _fh_format_api_errors(r)
+    print(f"  ❌ SCIM provision failed for {email!r}: {r.status_code} {detail}")
+    return False
+
+def fh_scim_lookup_user_by_email(email: str):
+    """Resolve {id, email} via SCIM when GET /users omits the user (e.g. soft-deleted/disabled)."""
+    if not email:
+        return None
+    em = email.strip()
+    try:
+        filt = f'userName eq "{em}"'
+        r = requests.get(
+            f"{FIREHYDRANT_BASE_URL}/scim/v2/Users",
+            headers={**FH_HEADERS, "Accept": "application/scim+json"},
+            params={"filter": filt},
+            timeout=30,
+        )
+        if r.status_code != 200:
+            return None
+        j = r.json()
+        resources = j.get("Resources") or []
+        if not resources:
+            return None
+        res = resources[0]
+        uid = res.get("id")
+        if not uid:
+            return None
+        out_email = ""
+        for ent in (res.get("emails") or []):
+            if isinstance(ent, dict) and ent.get("value"):
+                out_email = str(ent["value"]).strip()
+                break
+        if not out_email:
+            out_email = (res.get("userName") or em).strip()
+        return {"id": uid, "email": out_email}
+    except Exception:
+        return None
+
+def fh_prompt_and_provision_missing_team_members(pd_team_members: list, fh_users: list) -> list:
+    """Offer SCIM provisioning for PD emails with no FH match; returns refreshed fh_users list."""
+    pairs = []
+    for m in pd_team_members or []:
+        em = pd_team_member_email(m)
+        if em:
+            pairs.append((m, em))
+    need_emails = sorted({em for _, em in pairs})
+    fh_users = fh_enrich_users_list_with_scim_lookup(fh_users, need_emails)
+    missing = [(m, em) for m, em in pairs if not fh_find_user_by_email(em, fh_users)]
+    if not missing:
+        return fh_users
+    print(
+        "\n⚠️  PagerDuty team member(s) not matched to FireHydrant users after GET /users + SCIM lookup by email:"
+    )
+    for _, em in missing:
+        print(f"     • {em}")
+    do = False
+    if NO_PROVISION_MISSING:
+        do = False
+    elif PROVISION_MISSING_USERS:
+        do = True
+    else:
+        try:
+            do = input("Provision them in FireHydrant via SCIM? [y/N]: ").strip().lower() in ('y', 'yes')
+        except Exception:
+            do = False
+    if not do:
+        print("  Skipping SCIM provisioning — those users will be omitted from team membership until they exist in FireHydrant.")
+        return fh_users
+    for m, em in missing:
+        uid = (m.get('user') or {}).get('id')
+        fh_scim_provision_user(em, pd_user_id=uid)
+    try:
+        fh_users = fh_fetch_users()
+    except Exception:
+        pass
+    # GET /users often excludes disabled users; SCIM may still return 409 + existing account
+    seen_ids = {u.get('id') for u in (fh_users or []) if u and u.get('id')}
+    for _, em in missing:
+        if fh_find_user_by_email(em, fh_users):
+            continue
+        alt = fh_scim_lookup_user_by_email(em)
+        if alt and alt.get('id') and alt['id'] not in seen_ids:
+            vprint(f"  ℹ️ Resolved {em!r} via SCIM userName lookup (not in /users list — may be disabled)")
+            fh_users = list(fh_users or [])
+            fh_users.append(alt)
+            seen_ids.add(alt['id'])
+    return fh_users
 
 def fh_find_team_by_name_or_id(name_or_id: str):
     # list teams and try to match
     page = 1
+    per_page = 200
     target = (name_or_id or '').strip().lower()
     best = None
-    while True:
-        r = requests.get(f"{FIREHYDRANT_BASE_URL}/teams?page={page}", headers=FH_HEADERS)
+    while page <= 500:
+        r = requests.get(
+            f"{FIREHYDRANT_BASE_URL}/teams",
+            headers=FH_HEADERS,
+            params={"page": page, "per_page": per_page},
+            timeout=45,
+        )
         if r.status_code != 200:
             break
         data = r.json()
-        arr = data.get('data') if isinstance(data, dict) else data
-        if not arr:
-            break
+        arr = data.get("data") if isinstance(data, dict) else data
+        arr = arr or []
         for t in arr:
             if (t.get('id') or '').lower() == target:
                 return t
             if (t.get('name') or '').strip().lower() == target:
                 best = best or t
-        if len(arr) < 100:
+        if len(arr) < per_page:
             break
         page += 1
     return best
 
 def fh_create_team(pd_team: dict):
+    name = (pd_team.get('name') or '').strip()
+    existing = fh_find_team_by_name_or_id(name) if name else None
+    if existing and existing.get('id'):
+        vprint(f"♻️ Reusing existing FireHydrant team by name: {name!r} ({existing.get('id')})")
+        if DRY_RUN or VERIFY_ONLY:
+            return {"id": existing.get('id'), "name": name or existing.get('name')}
+        return existing
     if DRY_RUN or VERIFY_ONLY:
         return {"id": "DRY_RUN", "name": pd_team.get('name')}
     payload = {"name": pd_team.get('name'), "description": (pd_team.get('description') or '')}
     r = requests.post(f"{FIREHYDRANT_BASE_URL}/teams", headers=FH_HEADERS, json=payload)
-    if r.status_code not in (200,201):
-        print(f"❌ Error creating team: {r.status_code} {r.text}")
+    if r.status_code not in (200, 201):
+        detail = _fh_format_api_errors(r)
+        print(f"❌ Error creating team: {r.status_code} {detail}")
+        if r.status_code == 400 and name:
+            low = detail.lower()
+            if 'taken' in low or 'already' in low:
+                retry = fh_find_team_by_name_or_id(name)
+                if retry and retry.get('id'):
+                    vprint(f"♻️ Reusing existing FireHydrant team after duplicate name: {name!r}")
+                    return retry
         return None
     team = r.json()
     try:
@@ -498,7 +995,7 @@ def fh_create_team(pd_team: dict):
         pass
     return team
 
-def fh_add_users_to_team(team_id: str, user_ids: list):
+def fh_add_users_to_team(team_id: str, user_ids: list, roles_map: dict = None):
     if not user_ids:
         return 0
     if DRY_RUN or VERIFY_ONLY:
@@ -512,7 +1009,14 @@ def fh_add_users_to_team(team_id: str, user_ids: list):
     team = g.json()
     existing = team.get('memberships') or []
     existing_ids = {m.get('user',{}).get('id') for m in existing if m.get('user')}
-    new_members = [{"user_id": uid} for uid in user_ids if uid not in existing_ids]
+    new_members = []
+    for uid in user_ids:
+        if uid in existing_ids:
+            continue
+        entry = {"user_id": uid}
+        if roles_map is not None:
+            entry["default_incident_role"] = roles_map.get(uid, "member")
+        new_members.append(entry)
     if not new_members:
         return 0
     patch = requests.patch(f"{FIREHYDRANT_BASE_URL}/teams/{team_id}", headers=FH_HEADERS,
@@ -528,6 +1032,107 @@ def fh_list_schedules(team_id: str):
         return []
     data = r.json()
     return data.get('data') if isinstance(data, dict) else (data or [])
+
+
+def fh_get_on_call_schedule(team_id: str, schedule_id: str):
+    if not team_id or not schedule_id:
+        return None
+    r = requests.get(
+        f"{FIREHYDRANT_BASE_URL}/teams/{team_id}/on_call_schedules/{schedule_id}",
+        headers=FH_HEADERS,
+        timeout=45,
+    )
+    if r.status_code != 200:
+        vprint(f"FH GET on_call_schedules/{schedule_id} → {r.status_code}")
+        return None
+    try:
+        return r.json() or {}
+    except Exception:
+        return None
+
+
+def fh_first_rotation_id(team_id: str, schedule_id: str, sched: dict = None) -> str:
+    """First rotation id; list endpoints often omit nested rotations so we GET schedule detail."""
+    sj = sched if isinstance(sched, dict) else {}
+    rots = sj.get("rotations") or []
+    if rots and isinstance(rots[0], dict) and rots[0].get("id"):
+        return rots[0]["id"]
+    detail = fh_get_on_call_schedule(team_id, schedule_id) or {}
+    rots = detail.get("rotations") or []
+    if rots and isinstance(rots[0], dict) and rots[0].get("id"):
+        return rots[0]["id"]
+    return ""
+
+
+def fh_get_rotation(team_id: str, schedule_id: str, rotation_id: str):
+    if not team_id or not schedule_id or not rotation_id:
+        return None
+    r = requests.get(
+        f"{FIREHYDRANT_BASE_URL}/teams/{team_id}/on_call_schedules/{schedule_id}/rotations/{rotation_id}",
+        headers=FH_HEADERS,
+        timeout=45,
+    )
+    if r.status_code != 200:
+        vprint(f"FH GET rotation {rotation_id} → {r.status_code}")
+        return None
+    try:
+        return r.json() or {}
+    except Exception:
+        return None
+
+
+def fh_rotation_member_user_ids(team_id: str, schedule_id: str, rotation_id: str) -> list:
+    """User ids on a rotation (memberships). Empty if the API shape could not be read."""
+    rot = fh_get_rotation(team_id, schedule_id, rotation_id) or {}
+    seen = set()
+    ordered = []
+
+    def _take(uid):
+        if uid and uid not in seen:
+            seen.add(uid)
+            ordered.append(uid)
+
+    for m in rot.get("memberships") or []:
+        if isinstance(m, dict):
+            _take(m.get("user_id") or (m.get("user") or {}).get("id"))
+    if not ordered:
+        for m in rot.get("members") or []:
+            if isinstance(m, dict):
+                # Some FH tenants return members as user objects: {"id","name","email",...}
+                _take(m.get("user_id") or (m.get("user") or {}).get("id") or m.get("id"))
+    if not ordered and isinstance(rot.get("member_ids"), list):
+        for uid in rot.get("member_ids"):
+            _take(uid)
+    if not ordered:
+        sj = fh_get_on_call_schedule(team_id, schedule_id) or {}
+        for r0 in sj.get("rotations") or []:
+            if (r0.get("id") or "") != (rotation_id or ""):
+                continue
+            for m in r0.get("memberships") or r0.get("members") or []:
+                if isinstance(m, dict):
+                    _take(m.get("user_id") or (m.get("user") or {}).get("id") or m.get("id"))
+            if isinstance(r0.get("member_ids"), list):
+                for uid in r0["member_ids"]:
+                    _take(uid)
+            break
+    return ordered
+
+
+def fh_ensure_user_on_rotation(team_id: str, schedule_id: str, rotation_id: str, user_id: str) -> bool:
+    """FireHydrant may 5xx if override user_id is not on the rotation; merge into existing members."""
+    if not user_id or DRY_RUN or VERIFY_ONLY:
+        return True
+    cur = fh_rotation_member_user_ids(team_id, schedule_id, rotation_id)
+    if user_id in cur:
+        return True
+    if not cur:
+        vprint(
+            "  ℹ️  Could not read rotation member list; skipping membership merge "
+            "(avoid replacing rotation with a single user)"
+        )
+        return False
+    return fh_add_members_to_rotation(team_id, schedule_id, rotation_id, cur + [user_id])
+
 
 def fh_find_schedule_by_name_or_id(team_id: str, ident: str):
     ident_l = (ident or '').strip().lower()
@@ -632,18 +1237,106 @@ def fh_add_members_to_rotation(team_id: str, schedule_id: str, rotation_id: str,
         pass
     return False
 
-def fh_apply_override(team_id: str, schedule_id: str, rotation_id: str, start_iso: str, end_iso: str, user_id: str = None):
+
+def fh_schedule_time_zone(team_id: str, schedule_id: str) -> str:
+    """IANA timezone from FH schedule (for override payloads some tenants require local offset, not Z)."""
+    sj = fh_get_on_call_schedule(team_id, schedule_id) or {}
+    return (sj.get("time_zone") or sj.get("timezone") or "UTC").strip() or "UTC"
+
+
+def fh_apply_override(
+    team_id: str,
+    schedule_id: str,
+    rotation_id: str,
+    start_iso: str,
+    end_iso: str,
+    user_id: str = None,
+    user_email: str = "",
+    schedule_name: str = "",
+):
     if DRY_RUN or VERIFY_ONLY or NO_OVERRIDES:
         return True
+    sched_lbl = schedule_name or schedule_id or "unknown-schedule"
+    user_lbl = (user_email or "").strip() or (user_id or "unassigned")
+    if not rotation_id:
+        vprint(
+            f"  ⚠️  fh_apply_override: missing rotation_id "
+            f"(schedule={sched_lbl!r}, user={user_lbl!r}, window={start_iso} → {end_iso})"
+        )
+        return False
     url = f"{FIREHYDRANT_BASE_URL}/teams/{team_id}/on_call_schedules/{schedule_id}/rotations/{rotation_id}/overrides"
-    body = {"start_time": start_iso, "end_time": end_iso}
-    if user_id:
-        body["user_id"] = user_id
-    r = requests.post(url, headers=FH_HEADERS, json=body)
-    return r.status_code in (200,201)
+    start_fh = _fh_override_time_iso(start_iso) or start_iso
+    end_fh = _fh_override_time_iso(end_iso) or end_iso
+    if not start_fh or not end_fh:
+        vprint("  ⚠️  skip override: empty start or end after normalization")
+        return False
+    st = _parse_iso(start_fh.replace("Z", "+00:00") if start_fh.endswith("Z") else start_fh)
+    et = _parse_iso(end_fh.replace("Z", "+00:00") if end_fh.endswith("Z") else end_fh)
+    if not st or not et or st >= et:
+        vprint(f"  ⚠️  skip override: invalid window {start_fh!r} → {end_fh!r}")
+        return False
+
+    uid_body = (user_id or "").strip() or None
+    if uid_body:
+        if not fh_ensure_user_on_rotation(team_id, schedule_id, rotation_id, uid_body):
+            print(
+                "  ⚠️  Override user may not be on this rotation (and membership could not be merged). "
+                f"Schedule={sched_lbl!r}, user={user_lbl!r}, window={start_iso} → {end_iso}. "
+                "Add them to the FireHydrant team/schedule, or the override may fail."
+            )
+
+    tz_name = fh_schedule_time_zone(team_id, schedule_id)
+    start_local, end_local = _fh_windows_as_schedule_tz_iso(st, et, tz_name)
+    bases = [{"start_time": start_fh, "end_time": end_fh}]
+    if (start_local, end_local) != (start_fh, end_fh):
+        bases.append({"start_time": start_local, "end_time": end_local})
+    if rotation_id:
+        for b in list(bases):
+            bases.append({**b, "rotation_id": rotation_id})
+    # Dedupe identical JSON shapes
+    seen_keys = set()
+    uniq_bases = []
+    for b in bases:
+        k = json.dumps(b, sort_keys=True)
+        if k in seen_keys:
+            continue
+        seen_keys.add(k)
+        uniq_bases.append(b)
+
+    last_r = None
+    for base in uniq_bases:
+        for uid_try in ([uid_body] if uid_body else []) + [None]:
+            payload = dict(base)
+            if uid_try:
+                payload["user_id"] = uid_try
+            elif "user_id" in payload:
+                del payload["user_id"]
+            last_r = requests.post(url, headers=FH_HEADERS, json=payload, timeout=45)
+            vprint(f"    FH override POST → {last_r.status_code} payload keys={list(payload.keys())}")
+            if last_r.status_code in (200, 201):
+                if uid_body and not uid_try:
+                    print(
+                        "  ⚠️  Override applied without user_id "
+                        f"(schedule={sched_lbl!r}, requested_user={user_lbl!r}, window={start_iso} → {end_iso}). "
+                        "Assign in FireHydrant if needed."
+                    )
+                return True
+
+    detail = _fh_format_api_errors(last_r) if last_r is not None else "no response"
+    print(
+        f"  ❌ FireHydrant override failed "
+        f"(schedule={sched_lbl!r}, user={user_lbl!r}, window={start_iso} → {end_iso}) "
+        f"({last_r.status_code if last_r else '?' }): {detail}"
+    )
+    vprint(f"    Last POST {url} tried schedule TZ={tz_name!r} (UTC + local + optional rotation_id variants)")
+    print(
+        "  ℹ️  POST /shifts cannot replace a PD override when shifts already exist (overlap). "
+        "If every variant 500s, set the override in the FireHydrant UI or contact FireHydrant support with the schedule id."
+    )
+    return False
 
 def fh_apply_pd_boundary_overrides(team_id: str, schedule_id: str, rotation_id: str, pd_schedule_id: str, fh_users: list, weeks_ahead: int = 8) -> int:
-    """Overlay PD on-call segments as FH overrides to ensure exact weekly boundaries."""
+    """Overlay PD /oncalls segments as FH overrides (or shifts via fh_apply_override). High volume; enable with PD_ENFORCE_BOUNDARIES=true."""
     try:
         since = (_now_dt() - timedelta(days=1)).isoformat().replace('+00:00','Z')
         until = (_now_dt() + timedelta(days=7*weeks_ahead)).isoformat().replace('+00:00','Z')
@@ -655,7 +1348,15 @@ def fh_apply_pd_boundary_overrides(team_id: str, schedule_id: str, rotation_id: 
             email = (seg.get('email') or '').strip().lower()
             fh_user = fh_find_user_by_email(email, fh_users) if email else None
             uid = fh_user.get('id') if fh_user else None
-            ok = fh_apply_override(team_id, schedule_id, rotation_id, seg.get('start'), seg.get('end'), uid)
+            ok = fh_apply_override(
+                team_id,
+                schedule_id,
+                rotation_id,
+                seg.get('start'),
+                seg.get('end'),
+                uid,
+                user_email=email,
+            )
             if ok:
                 applied += 1
         return applied
@@ -749,13 +1450,19 @@ def align_now_pd_to_fh(team_id: str, fh_schedule_id: str, pd_schedule_id: str = 
 
 # -------- Utilities --------
 
-from datetime import datetime, timedelta, timezone
-
 def _now_dt():
     return datetime.now(timezone.utc)
 
 def _now_iso():
     return _now_dt().isoformat().replace('+00:00', 'Z')
+
+
+def _pd_override_window_iso():
+    """PagerDuty override list window (since/until query params)."""
+    since = (_now_dt() - timedelta(days=PD_OVERRIDE_SINCE_DAYS)).isoformat().replace("+00:00", "Z")
+    until = (_now_dt() + timedelta(days=PD_OVERRIDE_UNTIL_DAYS)).isoformat().replace("+00:00", "Z")
+    return since, until
+
 
 def _parse_iso(s: str):
     if not s:
@@ -764,6 +1471,41 @@ def _parse_iso(s: str):
         return datetime.fromisoformat(s.replace('Z','+00:00'))
     except Exception:
         return None
+
+
+def _fh_override_time_iso(pd_iso: str) -> str:
+    """Normalize PagerDuty override start/end to UTC RFC3339 for FireHydrant (second precision)."""
+    if not pd_iso:
+        return ""
+    try:
+        dt = _parse_iso(pd_iso)
+        if not dt:
+            return pd_iso
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.astimezone(timezone.utc).replace(microsecond=0)
+        return dt.isoformat().replace("+00:00", "Z")
+    except Exception:
+        return pd_iso
+
+
+def _fh_windows_as_schedule_tz_iso(st: datetime, et: datetime, tz_name: str) -> tuple:
+    """Same instants as RFC3339 in the schedule's IANA zone (offset form)."""
+    try:
+        from zoneinfo import ZoneInfo
+
+        zi = ZoneInfo((tz_name or "").strip() or "UTC")
+    except Exception:
+        from zoneinfo import ZoneInfo
+
+        zi = ZoneInfo("UTC")
+    try:
+        s = st.astimezone(zi).replace(microsecond=0).isoformat()
+        e = et.astimezone(zi).replace(microsecond=0).isoformat()
+        return s, e
+    except Exception:
+        return "", ""
+
 
 def _iso_duration_minutes(minutes: int):
     try:
@@ -812,12 +1554,19 @@ def _layer_members_emails(layer: dict):
                 emails.append(inner['email'])
                 continue
             uid = inner.get('id') or u.get('id')
-            if uid and uid in PD_USER_EMAIL_BY_ID:
-                emails.append(PD_USER_EMAIL_BY_ID[uid])
+            if uid:
+                em = _resolve_pd_user_email(uid)
+                if em:
+                    emails.append(em)
     # legacy: participants?
     for p in layer.get('participants', []) or []:
-        if p.get('user', {}).get('email'):
-            emails.append(p['user']['email'])
+        pu = p.get('user') or {}
+        if pu.get('email'):
+            emails.append(pu['email'])
+        elif pu.get('id'):
+            em = _resolve_pd_user_email(pu['id'])
+            if em:
+                emails.append(em)
     # de-duplicate preserving order
     seen = set(); out = []
     for e in emails:
@@ -837,6 +1586,45 @@ def _ep_schedule_ids(pd_ep: dict):
                 if sid and sid not in ids:
                     ids.append(sid)
     return ids
+
+def pd_schedules_for_service_id(svc_id: str):
+    """Schedules tied to a PD service: those referenced by its escalation policy (not team_ids filter)."""
+    if not svc_id:
+        return []
+    r = requests.get(f"{PAGERDUTY_BASE_URL}/services/{svc_id}", headers=PD_HEADERS)
+    vprint(f"PD GET /services/{svc_id} (schedules for service bucket) → {r.status_code}")
+    if r.status_code != 200:
+        return []
+    svc = r.json().get("service") or {}
+    ep_ref = (svc.get("escalation_policy") or {}).get("id")
+    ep = pd_escalation_policy_details(ep_ref) if ep_ref else None
+    sched_ids = _ep_schedule_ids(ep) if ep else []
+    out = []
+    for sid in sched_ids:
+        det = pd_schedule_details(sid)
+        if det:
+            out.append({"id": sid, "name": det.get("name")})
+    return out
+
+def _collect_participant_emails_from_pd_schedules(pd_scheds: list) -> list:
+    """Unique emails from all schedule layers (for SCIM/team membership when PD has no team members)."""
+    seen = set()
+    out = []
+    for s in pd_scheds or []:
+        sid = s.get("id")
+        if not sid:
+            continue
+        det = pd_schedule_details(sid) or {}
+        layers = det.get("schedule_layers") or det.get("layers") or []
+        for L in layers or []:
+            for em in _layer_members_emails(L):
+                if not em:
+                    continue
+                el = em.strip().lower()
+                if el and el not in seen:
+                    seen.add(el)
+                    out.append(em.strip())
+    return out
 
 # -------- EP mapping (PD → FH preview) --------
 
@@ -917,7 +1705,15 @@ def build_team_preview_pd(pd_team: dict, members_map: dict):
     preview = {
         "team": pd_team.get('name'),
         "team_id": team_id,
-        "members_to_add": [m.get('user',{}).get('email') for m in (members_map.get(team_id) or []) if (m.get('user',{}) or {}).get('email')],
+        "members_to_add": [
+            {
+                "email": pd_team_member_email(m),
+                "pd_role": m.get('role', 'responder'),
+                "fh_role": "owner" if m.get('role') == "manager" else "member",
+            }
+            for m in (members_map.get(team_id) or [])
+            if pd_team_member_email(m)
+        ],
         "schedules": [],
         "escalation_policies": [],
         "services": [{"id": s.get('id'), "name": s.get('name'), "escalation_policy_id": (s.get('escalation_policy') or {}).get('id')} for s in services]
@@ -941,8 +1737,7 @@ def build_team_preview_pd(pd_team: dict, members_map: dict):
             })
         overrides = []
         try:
-            since = (_now_dt() - timedelta(days=30)).isoformat().replace('+00:00','Z')
-            until = (_now_dt() + timedelta(days=60)).isoformat().replace('+00:00','Z')
+            since, until = _pd_override_window_iso()
             overrides = pd_list_overrides(s.get('id'), since, until)
         except Exception:
             pass
@@ -1021,7 +1816,14 @@ def main():
     argv = sys.argv[1:]
     # deletes / revert-all passthroughs (same semantics as OG file)
     if '--help' in argv or '-h' in argv:
-        print("Usage: python3 migrate-teams-pd.py [options]\n\n"
+        print("Usage: python3 signals-migrator-pagerduty.py [options]\n\n"
+              "Environment (env or config.env):\n"
+              "  FIREHYDRANT_API_KEY, PAGERDUTY_API_TOKEN\n"
+              "  PAGERDUTY_BASE_URL            Optional; omit to auto-detect US vs EU (api.pagerduty.com vs api.eu.pagerduty.com)\n"
+              "  PD_GROUP_BY                   teams | services (or prompt at startup if unset)\n"
+              "  PD_OVERRIDE_SINCE_DAYS        How far back to list PD schedule overrides (default 365)\n"
+              "  PD_OVERRIDE_UNTIL_DAYS        How far forward to list PD schedule overrides (default 730)\n"
+              "  PD_ENFORCE_BOUNDARIES         true = mirror every PD /oncalls segment as FH override (default false; can 500)\n\n"
               "Options:\n"
               "  --set-fh-token VALUE          Save FIREHYDRANT_API_KEY into config.env\n"
               "  --set-pd-token VALUE          Save PAGERDUTY_API_TOKEN into config.env\n"
@@ -1034,15 +1836,18 @@ def main():
               "  --team-id ID                  Team id for schedule deletes\n"
               "  --restriction-strategy STR    weekly | per-day (default: weekly)\n"
               "  --timezone-override Tz        Force schedule timezone\n"
-              "  --no-overrides                Skip migrating overrides\n"
+              "  --no-overrides                Skip migrating PD schedule overrides + boundary overlays\n"
+              "  --overrides [SUBSTR]          Backfill FH from PD: schedule overrides + on-call segments (filter optional)\n"
               "  --align / --no-align          Toggle PD→FH on-call alignment (default on)\n"
               "  --dry-run                     Print actions; no writes\n"
               "  --verify-only                 Fetch and compare; no writes\n"
               "  --verbose                     Show debug payloads and full API responses\n"
               "  --output PATH                 Write preview JSON for --dry-run/--preview-team\n"
               "  --pd-no-teams                 Fallback mode when PD Teams API is unavailable\n"
-              "  --pd-group-by MODE            teams | services (default: teams; services if no-teams)\n"
+              "  --pd-group-by MODE            teams | services (skips startup prompt; default teams if unset)\n"
               "  --pd-group MODE               Alias for --pd-group-by\n"
+              "  --provision-missing-users     Auto SCIM-provision PD team members missing in FH (no prompt)\n"
+              "  --no-provision-missing        Do not prompt or provision missing FH users\n"
               "  --align-now [NAME]            Align FH schedule to PD current on-call\n"
               "     --team-id ID | --team NAME     FH team id or exact name (or use NAME)\n"
               "     --fh-schedule-id ID | --schedule NAME  FH schedule id or name (defaults from team/NAME)\n"
@@ -1084,6 +1889,9 @@ def main():
         except KeyboardInterrupt:
             print("\n✋ Aborted")
         return
+
+    pd_resolve_pagerduty_api_host()
+
     # align-now mode (runs independently; no migration)
     if '--align-now' in argv:
         idx = argv.index('--align-now')
@@ -1402,6 +2210,13 @@ def main():
             flt = argv[idx].strip()
         fh_users = fh_fetch_users()
         fh_teams = fh_fetch_teams()
+        try:
+            PD_USER_EMAIL_BY_ID.clear()
+            for u in pd_fetch_users() or []:
+                if u.get("id") and u.get("email"):
+                    PD_USER_EMAIL_BY_ID[u["id"]] = u["email"]
+        except Exception:
+            pass
         def _fh_list_schedules(team_id: str):
             r = requests.get(f"{FIREHYDRANT_BASE_URL}/teams/{team_id}/on_call_schedules", headers=FH_HEADERS)
             if r.status_code != 200:
@@ -1433,15 +2248,53 @@ def main():
                     print(f"    - {seg.get('email') or 'unknown'} {seg.get('start')} → {seg.get('end')}")
                 if len(segs) > 20:
                     print(f"    … and {len(segs)-20} more")
-                yn = input("  Apply these as FH overrides? (y/N): ").strip().lower()
+                since_ov, until_ov = _pd_override_window_iso()
+                ovs_prev = pd_list_overrides(pd_sid, since_ov, until_ov) or []
+                print(f"  🔎 PagerDuty schedule overrides in window ({len(ovs_prev)}):")
+                for ov in ovs_prev[:15]:
+                    pu = ov.get("user") or {}
+                    who = pu.get("summary") or pu.get("email") or pu.get("id")
+                    print(f"    - {ov.get('start')} → {ov.get('end')}  ({who})")
+                if len(ovs_prev) > 15:
+                    print(f"    … and {len(ovs_prev)-15} more")
+                yn = input("  Apply PD schedule overrides + on-call segments as FH overrides? (y/N): ").strip().lower()
                 if yn not in ('y','yes'):
                     continue
-            rot_id = (s.get('rotations') or [{}])[0].get('id')
+            rot_id = fh_first_rotation_id(t.get("id"), s.get("id"), s)
+            if not rot_id:
+                print("  ⚠️  Could not resolve FireHydrant rotation id; skipping")
+                continue
+            n_sched = 0
+            since_ov, until_ov = _pd_override_window_iso()
+            for ov in pd_list_overrides(pd_sid, since_ov, until_ov) or []:
+                start = ov.get("start")
+                end = ov.get("end")
+                pu = ov.get("user") or {}
+                user_email = (pu.get("email") or "").strip()
+                if not user_email and pu.get("id"):
+                    user_email = _resolve_pd_user_email(pu["id"])
+                fh_uid = None
+                if user_email:
+                    fu = fh_find_user_by_email(user_email, fh_users)
+                    fh_uid = fu.get("id") if fu else None
+                if fh_apply_override(
+                    t.get("id"),
+                    s.get("id"),
+                    rot_id,
+                    start,
+                    end,
+                    fh_uid,
+                    user_email=user_email,
+                    schedule_name=s.get("name"),
+                ):
+                    n_sched += 1
             applied = fh_apply_pd_boundary_overrides(t.get('id'), s.get('id'), rot_id, pd_sid, fh_users, weeks_ahead=12)
-            print(f"  ✅ Applied {applied} override(s)")
-            total += applied
-        print(f"\n🎉 Done. Total overrides applied: {total}")
+            print(f"  ✅ Applied {n_sched} PagerDuty schedule override(s), {applied} on-call segment override(s)")
+            total += n_sched + applied
+        print(f"\n🎉 Done. Total override POSTs: {total}")
         return
+
+    prompt_pd_import_grouping_if_needed()
 
     # Fetch PD teams/users
     pd_teams = pd_fetch_teams()
@@ -1462,7 +2315,7 @@ def main():
     # members by team (parallel)
     team_members_map = {}
     with ThreadPoolExecutor(max_workers=CONCURRENCY) as ex:
-        futures = {ex.submit(pd_team_members, t['id']): t for t in pd_teams}
+        futures = {ex.submit(pd_team_members_for_bucket, t['id']): t for t in pd_teams}
         for f in as_completed(futures):
             t = futures[f]
             try:
@@ -1584,21 +2437,40 @@ def main():
             fh_team = fh_create_team(t)
             if not fh_team:
                 continue
-            fh_teams.append(fh_team)
+            tid = fh_team.get('id')
+            if tid and not any((x.get('id') == tid) for x in (fh_teams or [])):
+                fh_teams.append(fh_team)
         # 1) Team
-        # 2) Members
+        # 2) Members (PD team roster + linked PD team(s) for services + schedule participants not on roster)
         stage("👥 Creating team members…")
-        member_emails = [ (m.get('user') or {}).get('email') for m in (team_members_map.get(t['id']) or []) ]
+        pd_scheds = pd_team_schedules(t['id']) or []
+        member_rows = list(team_members_map.get(t['id']) or [])
+        sched_emails = _collect_participant_emails_from_pd_schedules(pd_scheds)
+        seen_m = {(pd_team_member_email(m) or '').lower() for m in member_rows if pd_team_member_email(m)}
+        for em in sched_emails:
+            el = (em or '').strip().lower()
+            if el and el not in seen_m:
+                seen_m.add(el)
+                member_rows.append({"user": {"email": em}, "role": "responder"})
+        fh_users = fh_prompt_and_provision_missing_team_members(member_rows, fh_users)
+        member_emails = [pd_team_member_email(m) for m in member_rows]
         member_emails = [e for e in (member_emails or []) if e]
         fh_ids = []
         for em in member_emails:
             u = fh_find_user_by_email(em, fh_users)
             if u and u.get('id'):
                 fh_ids.append(u['id'])
-        added = fh_add_users_to_team(fh_team['id'], fh_ids)
+        roles_map = {}
+        for m in member_rows:
+            email = pd_team_member_email(m)
+            pd_role = m.get('role', 'responder')
+            fh_role = 'owner' if pd_role == 'manager' else 'member'
+            fu = fh_find_user_by_email(email, fh_users)
+            if fu and fu.get('id'):
+                roles_map[fu['id']] = fh_role
+        added = fh_add_users_to_team(fh_team['id'], fh_ids, roles_map)
         # 3) Schedules
         stage("📅 Creating schedules and rotations…")
-        pd_scheds = pd_team_schedules(t['id']) or []
         created_schedules = []
         # Map PD schedule id -> FH schedule id for EP target resolution
         pd_to_fh_sched = {}
@@ -1636,35 +2508,52 @@ def main():
                 pd_to_fh_sched[s.get('id')] = sched.get('id')
             except Exception:
                 pass
+            # List responses often omit rotations[]; GET schedule detail for rotation id (required for overrides).
+            rot_id = fh_first_rotation_id(fh_team["id"], sched.get("id"), sched)
             # Assign rotation members explicitly (API sometimes ignores at create-time)
             try:
-                rot_id = (sched.get('rotations') or [{}])[0].get('id')
                 if rot_id and member_ids:
                     ok = fh_add_members_to_rotation(fh_team['id'], sched.get('id'), rot_id, member_ids)
                     vprint(f"Add rotation members → {ok}")
             except Exception as _me:
                 vprint(f"  ⚠️ Could not add rotation members: {_me}")
-            # overrides (window: now-30d .. now+60d)
+            # PagerDuty schedule overrides → FireHydrant rotation overrides
             if not NO_OVERRIDES:
                 try:
-                    since = (_now_dt() - timedelta(days=30)).isoformat().replace('+00:00','Z')
-                    until = (_now_dt() + timedelta(days=60)).isoformat().replace('+00:00','Z')
+                    since, until = _pd_override_window_iso()
                     ovs = pd_list_overrides(s['id'], since, until) or []
-                    rot_id = (sched.get('rotations') or [{}])[0].get('id')
+                    if not rot_id:
+                        print("  ⚠️  Could not resolve FireHydrant rotation id; skipping PD overrides for this schedule")
+                    elif ovs:
+                        vprint(f"  Applying {len(ovs)} PagerDuty override(s) → FireHydrant…")
                     for ov in ovs:
+                        if not rot_id:
+                            break
                         start = ov.get('start'); end = ov.get('end')
-                        user_email = (ov.get('user') or {}).get('email')
+                        pu = ov.get('user') or {}
+                        user_email = (pu.get('email') or '').strip()
+                        # PD often returns user_reference with id + summary only (no email)
+                        if not user_email and pu.get('id'):
+                            user_email = _resolve_pd_user_email(pu['id'])
                         fh_uid = None
                         if user_email:
                             fu = fh_find_user_by_email(user_email, fh_users)
                             fh_uid = fu.get('id') if fu else None
-                        fh_apply_override(fh_team['id'], sched.get('id'), rot_id, start, end, fh_uid)
-                except Exception:
-                    pass
+                        fh_apply_override(
+                            fh_team['id'],
+                            sched.get('id'),
+                            rot_id,
+                            start,
+                            end,
+                            fh_uid,
+                            user_email=user_email,
+                            schedule_name=s.get('name'),
+                        )
+                except Exception as ex:
+                    vprint(f"  ⚠️ PD overrides block: {ex}")
             # Overlay PD boundary segments as overrides to ensure exact parity
             try:
-                if PD_ENFORCE_BOUNDARIES:
-                    rot_id = (sched.get('rotations') or [{}])[0].get('id')
+                if PD_ENFORCE_BOUNDARIES and rot_id:
                     applied = fh_apply_pd_boundary_overrides(fh_team['id'], sched.get('id'), rot_id, s['id'], fh_users, weeks_ahead=12)
                     vprint(f"Applied PD boundary overrides: {applied}")
             except Exception:
@@ -1733,6 +2622,9 @@ def main():
                             fh_sid = pd_to_fh_sched.get(pd_sid) or first_sched_id
                             if fh_sid:
                                 mapped_targets.append({"type": "OnCallSchedule", "id": fh_sid})
+                        # PD escalation policy targets we rely on are user + schedule shapes only; skip team pointers
+                        elif ttype in ('team_reference', 'team'):
+                            vprint(f"  ℹ️ Skipping EP target type {ttype!r} id={trg.get('id')!r} (map users/schedules only; not team targets)")
                         # Users
                         elif ttype in ('user_reference','user'):
                             pd_uid = trg.get('id')

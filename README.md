@@ -21,7 +21,13 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-2) Put API tokens in `config.env`
+2) Create local config from the template
+
+```bash
+cp config.env.example config.env
+```
+
+3) Put API tokens in `config.env`
 
 ```ini
 # Required for both migrators
@@ -43,6 +49,13 @@ You can also set keys interactively:
 python3 signals-migrator-opsgenie.py --configure
 # PagerDuty migrator
 python3 signals-migrator-pagerduty.py --configure
+```
+
+If you have `FIREHYDRANT_API_KEY` exported in your shell, it overrides `config.env` for the current process.
+To force the file value, run:
+
+```bash
+unset FIREHYDRANT_API_KEY
 ```
 
 ---
@@ -128,7 +141,7 @@ Alignment helpers
   - Aligns FH active shift to the current PD on‑call (resolves users by email; falls back to `/users/{id}` if PD omits emails in `/oncalls`).
 
 Boundary parity (PD → FH)
-- Environment flag: `PD_ENFORCE_BOUNDARIES=true` (default)
+- Environment flag: `PD_ENFORCE_BOUNDARIES=true` (default is `false`)
   - After schedule creation, the migrator fetches PD on‑call segments via `/oncalls?since&until` for the next N weeks and applies them as FH overrides to guarantee exact start/end parity with PD’s weekly handoff.
   - Disable with `PD_ENFORCE_BOUNDARIES=false` if you want raw FH rotation shifts only.
 
